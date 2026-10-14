@@ -79,6 +79,21 @@ JSON
 sleep 30
 printf 'too late\\n'
 `,
+  // Unrecognized exit code: must fail, never masquerade as an answer.
+  unknown: `#!/bin/sh
+printf 'some future output\\n'
+exit 7
+`,
+  // Both streams present: both must reach the model.
+  both: `#!/bin/sh
+printf 'OUT-LINE\\n'
+printf 'ERR-LINE\\n' >&2
+`,
+  // Huge error detail: the thrown message must be truncated.
+  big: `#!/bin/sh
+awk 'BEGIN { for (i = 0; i < 2000; i++) printf "PAD-LINE-%04d-0123456789\\n", i }'
+exit 5
+`,
 }
 
 /** The canonical value shape the tool returns. */
@@ -127,6 +142,11 @@ async function runAbortable(tool: Tool, args: Record<string, unknown>, afterMs: 
   const pending = tool.execute(args as never, { signal: controller.signal } as never)
   setTimeout(() => controller.abort(), afterMs)
   return (await pending) as Value
+}
+
+/** Invoke one tool call with an agent identity attached. */
+async function runWithAgent(tool: Tool, args: Record<string, unknown>): Promise<Value> {
+  return (await tool.execute(args as never, { signal: new AbortController().signal, agent: {} } as never)) as Value
 }
 
 describe('@deepseek-ai/dsh-experimental-tool-witr', () => {
@@ -261,12 +281,18 @@ describe.skipIf(noShellStubs)('exit-code contract', () => {
     expect(denied.output).toContain('owning process not detected')
   })
 
-  it('fails only on exit 4 and exit 5', async () => {
+  it('fails on exit 4 and exit 5', async () => {
     const ambiguous = await mount({ binaryPath: stub('ambiguous') })
     await expect(run(ambiguous, { target: 'node' })).rejects.toThrow(/exit 4[\s\S]*ambiguous match/)
 
     const internal = await mount({ binaryPath: stub('internal') })
     await expect(run(internal, { target: 'node' })).rejects.toThrow(/exit 5/)
+  })
+
+  it('fails an unrecognized exit code instead of answering', async () => {
+    const tool = await mount({ binaryPath: stub('unknown') })
+
+    await expect(run(tool, { target: 'node' })).rejects.toThrow(/exit 7/)
   })
 
   it('reports a missing binary with an actionable message', async () => {
@@ -302,6 +328,41 @@ describe.skipIf(noShellStubs)('output handling', () => {
       { content: [{ type: 'text', text: 'trace body' }], isError: false, meta: { exitCode: 1, warningCount: 1 } },
     ) as { card?: string; output?: string; exitCode?: number } | undefined
     expect(view).toMatchObject({ card: 'terminal', output: 'trace body', exitCode: 1 })
+  })
+
+  it('combines stdout and stderr so neither stream is lost', async () => {
+    const tool = await mount({ binaryPath: stub('both') })
+
+    const value = await run(tool, { target: 'node' })
+    expect(value.output).toContain('OUT-LINE')
+    expect(value.output).toContain('ERR-LINE')
+  })
+
+  it('truncates huge error detail instead of flooding context', async () => {
+    const tool = await mount({ binaryPath: stub('big') })
+
+    const error = await run(tool, { target: 'node' }).then(
+      () => {
+        throw new Error('expected the call to fail')
+      },
+      (cause: unknown) => cause as Error,
+    )
+    expect(error.message).toMatch(/truncated/)
+    expect(error.message.length).toBeLessThan(8000)
+  })
+
+  it('refuses a relative file target when the session directory is unavailable', async () => {
+    const tool = await mount({ binaryPath: stub('echo') })
+
+    await expect(runWithAgent(tool, { target: './Cargo.lock' })).rejects.toThrow(/absolute path/)
+    // Absolute paths still work without the directory.
+    expect((await runWithAgent(tool, { target: '/var/lib/dpkg/lock', kind: 'file' })).output).toContain('--file')
+  })
+
+  it('presents a call without throwing on a missing target', async () => {
+    const tool = await mount()
+
+    expect(() => tool.presentCall?.({} as never)).not.toThrow()
   })
 })
 

@@ -108,7 +108,9 @@ targets are passed to `witr` after a `--` terminator, so a process name that beg
 misread as a command-line flag.
 
 **Working directory.** A relative `file` target is resolved against the calling session's working
-directory rather than the directory the harness process was launched from.
+directory rather than the directory the harness process was launched from. When that directory is
+unavailable for an agent call, a relative `file` target is refused instead of silently resolving
+against the harness process directory — retry with an absolute path.
 
 **Concurrency.** The tool is read-only, so it is marked concurrency-safe and several traces may share
 one tool batch.
@@ -130,6 +132,7 @@ call:
 | `5` | Internal error | Error |
 | `6` | Found, but the cause can't be traced | **Answer** |
 | — | `witr` could not be started at all | Error naming `binaryPath` |
+| any other non-zero | Unrecognized status (signal, timeout, or a future `witr` code) | Error — never mistaken for an answer |
 
 The canonical result is structured — `{ output, format, exitCode, warnings? }` — with `output` as
 the model-facing projection. `warnings` is populated when `format: "json"` supplies witr's documented
@@ -203,8 +206,8 @@ Configured via Cordis YAML or the DeepSeek Web Settings UI:
 
 | Option | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `binaryPath` | `string` | `"witr"` | Path to the `witr` binary. |
-| `timeoutMs` | `number` | `10000` | Subprocess execution timeout in milliseconds. |
+| `binaryPath` | `string` | `"witr"` | Path to the `witr` binary. Blank values fall back to `"witr"`. |
+| `timeoutMs` | `number` | `10000` | Subprocess execution timeout in milliseconds (minimum `1`; unusable values fall back to `10000`). |
 
 ---
 

@@ -75,7 +75,7 @@ export interface Config {
 
 export const Config: Schema<Config> = Schema.object({
   binaryPath: Schema.string().default('witr').description('Path to the witr executable binary'),
-  timeoutMs: Schema.number().default(10_000).description('Execution timeout budget in milliseconds'),
+  timeoutMs: Schema.number().min(1).default(10_000).description('Execution timeout budget in milliseconds'),
 })
 
 /** Canonical value returned by one accepted witr invocation. */
@@ -178,13 +178,15 @@ async function runWitr(
 /**
  * Classify one invocation from its exit status.
  *
- * An unrecognized status is treated as an answer rather than a failure: good
- * output beats a thrown error, and a future witr code should not start
- * discarding results.
+ * An unrecognized non-zero status fails the call rather than answering: exit
+ * codes from timeouts, signals, or a future witr must never masquerade as a
+ * successful trace.
  */
 function outcomeOf(run: WitrRun): Outcome {
   if (run.spawnError !== undefined) return 'unavailable'
   switch (run.exitCode) {
+    case EXIT.ok:
+      return 'ok'
     case EXIT.warnings:
       return 'warnings'
     case EXIT.notFound:
@@ -198,8 +200,35 @@ function outcomeOf(run: WitrRun): Outcome {
     case EXIT.causeUnknown:
       return 'causeUnknown'
     default:
-      return 'ok'
+      return 'internalError'
   }
+}
+
+/** Resolve the execution timeout, falling back when the configured value is unusable. */
+function resolveTimeout(configured: number | undefined): number {
+  return typeof configured === 'number' && Number.isFinite(configured) && configured >= 1
+    ? configured
+    : 10_000
+}
+
+/** Whether a file target is absolute (POSIX or Windows drive rooted). */
+function isAbsolutePath(target: string): boolean {
+  return target.startsWith('/') || /^[A-Za-z]:[\\/]/.test(target)
+}
+
+/** Join both child streams so a warning on stderr is never dropped. */
+function combinedOutput(run: WitrRun): string {
+  const out = run.stdout ?? ''
+  const err = run.stderr ?? ''
+  if (out !== '' && err !== '') return `${out}${out.endsWith('\n') ? '' : '\n'}${err}`
+  return out || err
+}
+
+/** Cap error text so a huge child dump cannot flood the model context. */
+const MAX_ERROR_CHARS = 4_000
+
+function truncate(text: string, max: number = MAX_ERROR_CHARS): string {
+  return text.length > max ? `${text.slice(0, max)}\n… (truncated ${text.length - max} chars)` : text
 }
 
 /**
@@ -239,23 +268,29 @@ function stripEnvironment(value: unknown): void {
  * text stays the model-facing projection.
  */
 function buildValue(run: WitrRun, format: Format): ToolValue {
-  const raw = run.stdout || run.stderr
-  const value: ToolValue = {
-    output: raw === '' ? 'No output received from witr.' : raw,
-    format,
-    exitCode: run.exitCode,
+  if (format === 'json') {
+    // Parse the machine-readable stream alone so a trailing stderr note can
+    // never break JSON.parse; a non-JSON answer falls back to both streams.
+    const candidate = run.stdout !== '' ? run.stdout : run.stderr
+    try {
+      const parsed: unknown = JSON.parse(candidate)
+      stripEnvironment(parsed)
+      const value: ToolValue = {
+        output: JSON.stringify(parsed, null, 2),
+        format,
+        exitCode: run.exitCode,
+      }
+      const warnings = (parsed as { Warnings?: unknown } | null)?.Warnings
+      if (Array.isArray(warnings)) value.warnings = warnings.map(String)
+      return value
+    } catch {
+      // Not the documented JSON document; the raw text is the best answer we have.
+      const raw = combinedOutput(run)
+      return { output: raw === '' ? 'No output received from witr.' : raw, format, exitCode: run.exitCode }
+    }
   }
-  if (format !== 'json') return value
-  try {
-    const parsed: unknown = JSON.parse(raw)
-    stripEnvironment(parsed)
-    value.output = JSON.stringify(parsed, null, 2)
-    const warnings = (parsed as { Warnings?: unknown } | null)?.Warnings
-    if (Array.isArray(warnings)) value.warnings = warnings.map(String)
-  } catch {
-    // Not the documented JSON document; the raw text is the best answer we have.
-  }
-  return value
+  const raw = combinedOutput(run)
+  return { output: raw === '' ? 'No output received from witr.' : raw, format, exitCode: run.exitCode }
 }
 
 /** Build the error for a witr that produced no answer worth returning. */
@@ -268,10 +303,12 @@ function failureError(run: WitrRun, outcome: Outcome, binary: string): Error {
     const message = run.spawnError instanceof Error ? run.spawnError.message : String(run.spawnError)
     return new Error(`witr failed to run: ${message}`)
   }
-  const detail = [run.stdout, run.stderr]
-    .map(part => part.trim())
-    .filter(part => part !== '')
-    .join('\n')
+  const detail = truncate(
+    [run.stdout, run.stderr]
+      .map(part => part.trim())
+      .filter(part => part !== '')
+      .join('\n'),
+  )
   const summary = outcome === 'invalidInput'
     ? `witr rejected the target (exit ${run.exitCode})`
     : `witr hit an internal error (exit ${run.exitCode})`
@@ -279,8 +316,9 @@ function failureError(run: WitrRun, outcome: Outcome, binary: string): Error {
 }
 
 export function apply(ctx: Context, config: Config = {}) {
-  const binary = config.binaryPath || 'witr'
-  const defaultTimeout = config.timeoutMs || 10_000
+  const configuredBinary = config.binaryPath?.trim()
+  const binary = configuredBinary !== undefined && configuredBinary !== '' ? configuredBinary : 'witr'
+  const defaultTimeout = resolveTimeout(config.timeoutMs)
 
   // Register main witr_trace tool
   ctx.tools.register(
@@ -334,7 +372,7 @@ export function apply(ctx: Context, config: Config = {}) {
       // Read-only system inspection: several traces may run in one tool batch.
       isConcurrencySafe: () => true,
       presentCall: (args) => {
-        const target = args.target.trim()
+        const target = String(args.target ?? '').trim()
         const kind = inferKind(target, args.kind)
         return {
           card: 'terminal',
@@ -359,13 +397,21 @@ export function apply(ctx: Context, config: Config = {}) {
         }
       },
       async execute(args, exec) {
-        const target = args.target.trim()
+        const target = String(args.target ?? '').trim()
         if (target === '') throw new Error('witr_trace requires a non-empty "target"')
 
         const kind = inferKind(target, args.kind)
         const format = args.format ?? 'standard'
         // Only a file target depends on the session directory.
         const cwd = kind === 'file' ? await sessionCwd(ctx, exec) : undefined
+        // A relative file without its session directory would silently resolve
+        // against the harness process directory, so refuse instead of tracing
+        // the wrong file. Agent-less system calls keep the old behavior.
+        if (kind === 'file' && !isAbsolutePath(target) && cwd === undefined && exec.agent !== undefined) {
+          throw new Error(
+            'witr_trace cannot resolve this relative file target without the session working directory; retry with an absolute path',
+          )
+        }
 
         const attempt = (attemptKind: Kind, attemptCwd?: string): Promise<WitrRun> =>
           runWitr(binary, cliArguments(attemptKind, target, args), {
@@ -381,8 +427,8 @@ export function apply(ctx: Context, config: Config = {}) {
           run = await attempt('port')
         }
 
-        // Settling instead of throwing lets the registry classify the call as
-        // cancelled rather than as an ordinary tool failure.
+        // Settling instead of throwing lets the registry replace this success
+        // with its canonical ABORTED result rather than a generic tool failure.
         if (exec.signal.aborted) return { output: 'witr_trace was aborted.', format }
 
         const outcome = outcomeOf(run)
