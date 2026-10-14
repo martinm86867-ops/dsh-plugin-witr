@@ -1,6 +1,6 @@
 - insert:
     - id: tool-witr
-      name: "dsh-plugin-witr"
+      name: "@deepseek-ai/dsh-experimental-tool-witr"
       config:
         binaryPath: witr
         timeoutMs: 10000
