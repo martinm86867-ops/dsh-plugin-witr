@@ -1,0 +1,16 @@
+<svg width="36" height="36" viewBox="0 0 36 36" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="witrParent" x1="8.5" y1="3" x2="8.5" y2="14" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#69B9FF" />
+      <stop offset="1" stop-color="#324DE2" />
+    </linearGradient>
+    <linearGradient id="witrTarget" x1="27.5" y1="22" x2="27.5" y2="33" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#45E7A4" />
+      <stop offset="1" stop-color="#05909D" />
+    </linearGradient>
+  </defs>
+  <path d="M14 14C14 22 16 26 22 26" stroke="#69B9FF" stroke-opacity="0.9" stroke-width="2" stroke-linecap="round" fill="none" />
+  <rect x="3" y="3" width="11" height="11" rx="3" fill="url(#witrParent)" />
+  <rect x="22" y="22" width="11" height="11" rx="3" fill="url(#witrTarget)" />
+  <circle cx="8.5" cy="8.5" r="2" fill="#0B1220" fill-opacity="0.35" />
+</svg>

@@ -49,9 +49,9 @@ graph TD
 - **Full Causal Ancestry:** Traces processes backwards through `systemd -> ptyxis -> bash -> node -> esbuild` to pinpoint what launched and maintains the target.
 - **Port Collision Resolution:** Translates port numbers (e.g. `3080`, `8080`) directly into the owning PID, parent shell, working directory, and active Git branch.
 - **File Lock Diagnostics:** Pinpoints which background process or daemon holds open a file descriptor.
-- **Multi-Format Projection:** Supports human-readable diagnostic text, compact hierarchical trees, raw JSON, and **Mermaid.js flowchart diagrams** for visual documentation.
-- **DeepSeek Plugin Manager UI:** Fully declared Cordis bundle with metadata, icons, and configurable runtime parameters in the Web UI.
-- **Cancellation & Safety:** Strictly read-only; automatically aborts child subprocesses if the agent turn is cancelled via `exec.signal`.
+- **Multi-Format Projection:** Supports human-readable diagnostic text, compact hierarchical trees, JSON, and **Mermaid.js flowchart diagrams** for visual documentation. JSON output omits process environment variables, so tracing a process never copies its secrets into the model context.
+- **DeepSeek Plugin Manager UI:** Fully declared Cordis bundle with localized metadata, an icon, and configurable runtime parameters in the Web UI.
+- **Cancellation & Safety:** Strictly read-only; forwards `exec.signal` to the `witr` subprocess and reports a cancelled call as cancelled rather than as a failure.
 
 ---
 
@@ -68,7 +68,7 @@ witr --version
 
 ### Method 1: Add via DeepSeek CLI
 ```bash
-dsh plugin --profile web add dsh-plugin-witr
+dsh plugin --profile web add @deepseek-ai/dsh-experimental-tool-witr
 ```
 
 ### Method 2: Profile Mount (`cordis.patch.yml`)
@@ -77,7 +77,7 @@ Add an `- insert:` entry to your active profile patch file (`~/.dsh/profiles/<pr
 ```yaml
 - insert:
     - id: tool-witr
-      name: "dsh-plugin-witr"
+      name: "@deepseek-ai/dsh-experimental-tool-witr"
       config:
         binaryPath: witr
         timeoutMs: 10000
@@ -91,12 +91,26 @@ When mounted, DeepSeek models gain access to the following tool schema:
 
 ```typescript
 witr_trace({
-  target: string,    // Port number ("3080"), PID ("1234"), process name ("node"), or file path
-  kind?: string,      // Optional explicit discriminator: "port" | "pid" | "file" | "name"
-  format?: string,    // Output format: "standard" | "tree" | "mermaid" | "dot" | "json"
-  exact?: boolean     // Disable substring matching when searching by name
+  target: string,                            // Port ("3080"), PID ("1234"), name ("node"), or file path
+  kind?: "port" | "pid" | "file" | "name",   // Explicit discriminator; inferred when omitted
+  format?: "standard" | "tree" | "mermaid" | "dot" | "json",
+  exact?: boolean                            // Disable substring matching when searching by name
 })
 ```
+
+`kind`, `format`, and `target` are validated before `witr` runs, so an out-of-vocabulary
+`kind` or `format` is rejected instead of silently ignored.
+
+**Target inference.** With no `kind`, a bare number is tried as a process ID first and then as a
+port, a value containing `/` is treated as a file path, and anything else is a process name. Non-empty
+targets are passed to `witr` after a `--` terminator, so a process name that begins with `-` is never
+misread as a command-line flag.
+
+**Working directory.** A relative `file` target is resolved against the calling session's working
+directory rather than the directory the harness process was launched from.
+
+**Concurrency.** The tool is read-only, so it is marked concurrency-safe and several traces may share
+one tool batch.
 
 ### Example Agent Interactions
 
@@ -176,6 +190,9 @@ Configured via Cordis YAML or the DeepSeek Web Settings UI:
 ```bash
 # Install dependencies
 pnpm install
+
+# Typecheck the source and test suite
+pnpm run typecheck
 
 # Compile TypeScript
 pnpm run build
