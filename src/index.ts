@@ -33,8 +33,37 @@ type Format = (typeof FORMATS)[number]
 /** Maximum bytes of child output retained before the run fails. */
 const MAX_OUTPUT_BYTES = 4 * 1024 * 1024
 
-/** witr's own wording when a target resolves to nothing. */
-const NOT_FOUND = /no matching process or service found/i
+/**
+ * witr's documented exit codes. The code is the contract scripts are told to
+ * read; the wording of the human-readable text is explicitly NOT part of it, so
+ * an outcome must never be classified by matching output.
+ * @see https://github.com/pranshuparmar/witr#72-exit-codes
+ */
+const EXIT = {
+  /** Clean: the target was found with nothing to report. */
+  ok: 0,
+  /** The target was found and has warnings. Not a failure. */
+  warnings: 1,
+  /** Nothing matched: no such process, service, or (as root) port holder. */
+  notFound: 2,
+  /** Insufficient privileges: witr needs to run elevated. */
+  permission: 3,
+  /** Bad arguments, or a match too ambiguous to resolve. */
+  invalidInput: 4,
+  /** An unexpected failure inside witr. */
+  internalError: 5,
+  /** The target was found, but its cause cannot be traced. Not a failure. */
+  causeUnknown: 6,
+} as const
+
+/**
+ * How one invocation ended, derived from its exit status alone.
+ *
+ * `ok`, `warnings`, `notFound`, `permission` and `causeUnknown` are answers:
+ * witr produced output the model should read. `invalidInput`, `internalError`
+ * and `unavailable` are the only outcomes worth failing a tool call over.
+ */
+type Outcome = keyof typeof EXIT | 'unavailable'
 
 /** Configuration schema for witr tool plugin */
 export interface Config {
@@ -49,14 +78,28 @@ export const Config: Schema<Config> = Schema.object({
   timeoutMs: Schema.number().default(10_000).description('Execution timeout budget in milliseconds'),
 })
 
-/** One finished or failed witr invocation. */
+/** Canonical value returned by one accepted witr invocation. */
+interface ToolValue {
+  /** Output to show the model, in the requested presentation format. */
+  output: string
+  /** Presentation format `output` was produced in. */
+  format: Format
+  /** witr's exit code, omitted when the call was cancelled before it settled. */
+  exitCode?: number
+  /** Warning lines, when the JSON document carried them. */
+  warnings?: string[]
+}
+
+/** One finished witr invocation. */
 interface WitrRun {
   /** Standard output captured so far. */
   stdout: string
   /** Standard error captured so far. */
   stderr: string
-  /** Set when the process could not start, was killed, or exited non-zero. */
-  failure?: unknown
+  /** Process exit status, or -1 when the process never started. */
+  exitCode: number
+  /** Set when the process could not be started or was killed by a signal. */
+  spawnError?: unknown
 }
 
 /** Per-call options shared by the argument builder and the runner. */
@@ -107,7 +150,7 @@ function cliArguments(kind: Kind, target: string, options: CallOptions): string[
   return kind === 'name' ? [...flags, '--', target] : [...flags, `--${kind}`, target]
 }
 
-/** Run witr once, capturing output even when the process exits non-zero. */
+/** Run witr once, capturing output and the exit status it ended with. */
 async function runWitr(
   binary: string,
   cliArgs: string[],
@@ -120,16 +163,43 @@ async function runWitr(
       maxBuffer: MAX_OUTPUT_BYTES,
       cwd: options.cwd,
     })
-    return { stdout, stderr }
+    return { stdout, stderr, exitCode: EXIT.ok }
   } catch (error: unknown) {
-    const failure = error as { stdout?: string; stderr?: string } | null
-    return { stdout: failure?.stdout ?? '', stderr: failure?.stderr ?? '', failure: error }
+    const failure = error as { stdout?: string; stderr?: string; code?: unknown } | null
+    const code = failure?.code
+    // A numeric `code` is the child's exit status; anything else (for example
+    // 'ENOENT', or an abort) means the child never reported one.
+    return typeof code === 'number'
+      ? { stdout: failure?.stdout ?? '', stderr: failure?.stderr ?? '', exitCode: code }
+      : { stdout: failure?.stdout ?? '', stderr: failure?.stderr ?? '', exitCode: -1, spawnError: error }
   }
 }
 
-/** True when witr reported that the target does not exist. */
-function notFound(run: WitrRun): boolean {
-  return NOT_FOUND.test(`${run.stdout}\n${run.stderr}`)
+/**
+ * Classify one invocation from its exit status.
+ *
+ * An unrecognized status is treated as an answer rather than a failure: good
+ * output beats a thrown error, and a future witr code should not start
+ * discarding results.
+ */
+function outcomeOf(run: WitrRun): Outcome {
+  if (run.spawnError !== undefined) return 'unavailable'
+  switch (run.exitCode) {
+    case EXIT.warnings:
+      return 'warnings'
+    case EXIT.notFound:
+      return 'notFound'
+    case EXIT.permission:
+      return 'permission'
+    case EXIT.invalidInput:
+      return 'invalidInput'
+    case EXIT.internalError:
+      return 'internalError'
+    case EXIT.causeUnknown:
+      return 'causeUnknown'
+    default:
+      return 'ok'
+  }
 }
 
 /**
@@ -161,32 +231,51 @@ function stripEnvironment(value: unknown): void {
   for (const child of Object.values(record)) stripEnvironment(child)
 }
 
-/** Render one run that produced an answer for the model. */
-function present(run: WitrRun, format: Format | undefined): string {
-  const output = run.stdout || run.stderr
-  if (format !== 'json') return output || 'No output received from witr.'
-  try {
-    const parsed: unknown = JSON.parse(output)
-    stripEnvironment(parsed)
-    return JSON.stringify(parsed, null, 2)
-  } catch {
-    return output || 'No output received from witr.'
+/**
+ * Build the canonical value for one answered call.
+ *
+ * JSON output is re-serialized so environment blocks are gone, and its
+ * documented `Warnings` array is lifted into the value; the requested format's
+ * text stays the model-facing projection.
+ */
+function buildValue(run: WitrRun, format: Format): ToolValue {
+  const raw = run.stdout || run.stderr
+  const value: ToolValue = {
+    output: raw === '' ? 'No output received from witr.' : raw,
+    format,
+    exitCode: run.exitCode,
   }
+  if (format !== 'json') return value
+  try {
+    const parsed: unknown = JSON.parse(raw)
+    stripEnvironment(parsed)
+    value.output = JSON.stringify(parsed, null, 2)
+    const warnings = (parsed as { Warnings?: unknown } | null)?.Warnings
+    if (Array.isArray(warnings)) value.warnings = warnings.map(String)
+  } catch {
+    // Not the documented JSON document; the raw text is the best answer we have.
+  }
+  return value
 }
 
-/** Build the error shown when witr never produced a usable answer. */
-function failureError(run: WitrRun, binary: string): Error {
+/** Build the error for a witr that produced no answer worth returning. */
+function failureError(run: WitrRun, outcome: Outcome, binary: string): Error {
+  if (outcome === 'unavailable') {
+    const code = (run.spawnError as { code?: unknown } | undefined)?.code
+    if (code === 'ENOENT') {
+      return new Error(`could not run "${binary}"; install witr or set the plugin's binaryPath option`)
+    }
+    const message = run.spawnError instanceof Error ? run.spawnError.message : String(run.spawnError)
+    return new Error(`witr failed to run: ${message}`)
+  }
   const detail = [run.stdout, run.stderr]
     .map(part => part.trim())
     .filter(part => part !== '')
     .join('\n')
-  if (detail !== '') return new Error(`witr exited with an error:\n${detail}`)
-  const code = (run.failure as { code?: unknown } | undefined)?.code
-  if (code === 'ENOENT') {
-    return new Error(`could not run "${binary}"; install witr or set the plugin's binaryPath option`)
-  }
-  const message = run.failure instanceof Error ? run.failure.message : String(run.failure)
-  return new Error(`witr failed to run: ${message}`)
+  const summary = outcome === 'invalidInput'
+    ? `witr rejected the target (exit ${run.exitCode})`
+    : `witr hit an internal error (exit ${run.exitCode})`
+  return new Error(detail === '' ? summary : `${summary}:\n${detail}`)
 }
 
 export function apply(ctx: Context, config: Config = {}) {
@@ -198,7 +287,7 @@ export function apply(ctx: Context, config: Config = {}) {
     defineTool({
       name: 'witr_trace',
       description:
-        'Explains why a process is running, what started it, or what holds a port or file lock open by tracing its causal ancestry back to supervisors, shells, or containers.',
+        'Explains why a process is running, what started it, or what holds a port or file lock open by tracing its causal ancestry back to supervisors, shells, or containers. A successful answer may still carry warnings, and "not found" is a valid answer rather than an error.',
       parameters: {
         target: {
           type: 'string',
@@ -220,12 +309,27 @@ export function apply(ctx: Context, config: Config = {}) {
         },
         exact: {
           type: 'boolean',
-          description: 'Require exact match when searching by process name (disables substring search).',
+          description:
+            'Require exact match when searching by process name (disables substring search); use it when a name reports an ambiguous match.',
         },
       },
       output: {
-        schema: { type: 'string' },
-        render: (_args, value) => [{ type: 'text', text: value }],
+        schema: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            output: { type: 'string', required: true },
+            format: { type: 'string', required: true, enum: FORMATS },
+            exitCode: { type: 'integer' },
+            warnings: { type: 'array', items: { type: 'string' } },
+          },
+        },
+        render: (_args, value) => [{ type: 'text', text: value.output }],
+        presentationMeta: (_args, value) => ({
+          format: value.format,
+          ...value.exitCode === undefined ? {} : { exitCode: value.exitCode },
+          warningCount: value.warnings?.length ?? 0,
+        }),
       },
       // Read-only system inspection: several traces may run in one tool batch.
       isConcurrencySafe: () => true,
@@ -238,42 +342,56 @@ export function apply(ctx: Context, config: Config = {}) {
           description: 'Trace why a process, port, or file lock exists',
         }
       },
-      presentResult: (_args, result) => ({
-        card: 'terminal',
-        output: result.content
-          .map(block => (block.type === 'text' && 'text' in block ? String(block.text) : ''))
-          .filter(text => text !== '')
-          .join('\n'),
-      }),
+      presentResult: (_args, result) => {
+        const meta: unknown = result.meta
+        const exitCode =
+          typeof meta === 'object' && meta !== null && !Array.isArray(meta)
+            && typeof (meta as { exitCode?: unknown }).exitCode === 'number'
+            ? (meta as { exitCode: number }).exitCode
+            : undefined
+        return {
+          card: 'terminal',
+          output: result.content
+            .map(block => (block.type === 'text' && 'text' in block ? String(block.text) : ''))
+            .filter(text => text !== '')
+            .join('\n'),
+          ...exitCode === undefined ? {} : { exitCode },
+        }
+      },
       async execute(args, exec) {
         const target = args.target.trim()
         if (target === '') throw new Error('witr_trace requires a non-empty "target"')
 
         const kind = inferKind(target, args.kind)
+        const format = args.format ?? 'standard'
         // Only a file target depends on the session directory.
         const cwd = kind === 'file' ? await sessionCwd(ctx, exec) : undefined
 
-        let run = await runWitr(binary, cliArguments(kind, target, args), {
-          timeoutMs: defaultTimeout,
-          signal: exec.signal,
-          cwd,
-        })
-        // A bare number is ambiguous: try the likely reading, then the other one.
-        if (args.kind === undefined && kind === 'pid' && notFound(run)) {
-          run = await runWitr(binary, cliArguments('port', target, args), {
+        const attempt = (attemptKind: Kind, attemptCwd?: string): Promise<WitrRun> =>
+          runWitr(binary, cliArguments(attemptKind, target, args), {
             timeoutMs: defaultTimeout,
             signal: exec.signal,
+            cwd: attemptCwd,
           })
+
+        let run = await attempt(kind, cwd)
+        // A bare number is ambiguous: try the likely reading, then the other
+        // one. The decision rides on the exit code, never on witr's wording.
+        if (args.kind === undefined && kind === 'pid' && outcomeOf(run) === 'notFound') {
+          run = await attempt('port')
         }
 
         // Settling instead of throwing lets the registry classify the call as
         // cancelled rather than as an ordinary tool failure.
-        if (exec.signal.aborted) return 'witr_trace was aborted.'
+        if (exec.signal.aborted) return { output: 'witr_trace was aborted.', format }
 
-        // A resolved-but-empty answer and a real failure are different outcomes.
-        if (run.failure !== undefined && !notFound(run)) throw failureError(run, binary)
-
-        return present(run, args.format)
+        const outcome = outcomeOf(run)
+        if (outcome === 'unavailable' || outcome === 'invalidInput' || outcome === 'internalError') {
+          throw failureError(run, outcome, binary)
+        }
+        // `warnings`, `notFound`, `permission` and `causeUnknown` are answers:
+        // witr found the target, or found nothing, and its output says which.
+        return buildValue(run, format)
       },
     }),
   )

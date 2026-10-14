@@ -21,36 +21,72 @@ function witrAvailable(): boolean {
 const hasWitr = witrAvailable()
 const noShellStubs = process.platform === 'win32'
 
-/** Stub binaries, so argument construction is tested without the real witr. */
+/** Stub binaries, so exit handling and argument construction need no real witr. */
 const STUBS: Record<string, string> = {
   // Echo every argument, one per line.
   echo: `#!/bin/sh
 printf '%s\\n' "$@"
 `,
-  // Answer --pid with witr's "nothing found" text and anything else with a port answer.
+  // Report "not found" with witr's documented exit code for it.
   pidMiss: `#!/bin/sh
 case " $* " in
-  *" --pid "*) printf 'No matching process or service found. Please check your query.\\n' ;;
+  *" --pid "*) printf 'No matching process or service found.\\n'; exit 2 ;;
   *) printf 'PORT-RESULT\\n' ;;
 esac
 `,
-  // Emit JSON carrying environment blocks at two nesting levels.
+  // Found, but with warnings: exit 1 is an answer, not a failure.
+  warn: `#!/bin/sh
+printf 'Target: sleep\\nWarnings:\\n  - suspicious working directory: /tmp\\n'
+exit 1
+`,
+  // Found and clean.
+  ok: `#!/bin/sh
+printf 'Target: node\\n'
+`,
+  // Not found.
+  notFound: `#!/bin/sh
+printf 'No matching process or service found.\\n'
+exit 2
+`,
+  // Insufficient privileges.
+  denied: `#!/bin/sh
+printf 'socket found but owning process not detected\\n'
+exit 3
+`,
+  // Ambiguous match: the only input error worth failing on.
+  ambiguous: `#!/bin/sh
+printf 'ambiguous match: two processes named node\\n'
+exit 4
+`,
+  // Internal failure.
+  internal: `#!/bin/sh
+printf 'unexpected failure\\n'
+exit 5
+`,
+  // Found, but the cause cannot be traced: also an answer.
+  causeUnknown: `#!/bin/sh
+printf 'Target: node\\nCause unknown: the parent exited\\n'
+exit 6
+`,
+  // Emit JSON carrying environment blocks plus a warnings array.
   json: `#!/bin/sh
 cat <<'JSON'
-{"Target":{"Type":"pid","Value":"1"},"Process":{"PID":42,"Env":["SECRET=abc","TOKEN=xyz"]},"Ancestry":[{"PID":1,"Env":["SECRET=abc"]}]}
+{"Target":{"Type":"pid","Value":"42"},"Process":{"PID":42,"Env":["SECRET=abc","TOKEN=xyz"]},"Warnings":["Process is running from a suspicious working directory: /tmp"],"Ancestry":[{"PID":1,"Env":["SECRET=abc"]}]}
 JSON
-`,
-  // Fail loudly after producing output on both streams.
-  fail: `#!/bin/sh
-printf 'partial diagnostic\\n'
-printf 'stderr warning\\n' >&2
-exit 3
 `,
   // Wait long enough for a cancellation to arrive first.
   slow: `#!/bin/sh
 sleep 30
 printf 'too late\\n'
 `,
+}
+
+/** The canonical value shape the tool returns. */
+interface Value {
+  output: string
+  format: string
+  exitCode?: number
+  warnings?: string[]
 }
 
 let dir: string
@@ -78,21 +114,19 @@ async function mount(config: ToolWitr.Config = {}) {
   return tool
 }
 
+type Tool = Awaited<ReturnType<typeof mount>>
+
 /** Invoke one tool call with a fresh cancellation signal. */
-async function run(tool: Awaited<ReturnType<typeof mount>>, args: Record<string, unknown>): Promise<string> {
-  return (await tool.execute(args as never, { signal: new AbortController().signal } as never)) as string
+async function run(tool: Tool, args: Record<string, unknown>): Promise<Value> {
+  return (await tool.execute(args as never, { signal: new AbortController().signal } as never)) as Value
 }
 
 /** Invoke one tool call that the caller cancels after `afterMs`. */
-async function runAbortable(
-  tool: Awaited<ReturnType<typeof mount>>,
-  args: Record<string, unknown>,
-  afterMs: number,
-): Promise<string> {
+async function runAbortable(tool: Tool, args: Record<string, unknown>, afterMs: number): Promise<Value> {
   const controller = new AbortController()
   const pending = tool.execute(args as never, { signal: controller.signal } as never)
   setTimeout(() => controller.abort(), afterMs)
-  return (await pending) as string
+  return (await pending) as Value
 }
 
 describe('@deepseek-ai/dsh-experimental-tool-witr', () => {
@@ -105,6 +139,14 @@ describe('@deepseek-ai/dsh-experimental-tool-witr', () => {
     expect(parameters.properties.kind?.enum).toEqual(['port', 'pid', 'file', 'name'])
     expect(parameters.properties.format?.enum).toEqual(['standard', 'tree', 'mermaid', 'dot', 'json'])
     expect(tool.parameters).toMatchObject({ required: ['target'] })
+  })
+
+  it('declares a structured output schema', async () => {
+    const tool = await mount()
+
+    const schema = tool.output.schema as { properties: Record<string, unknown>; required?: string[] }
+    expect(Object.keys(schema.properties).sort()).toEqual(['exitCode', 'format', 'output', 'warnings'])
+    expect(schema.required).toEqual(['output', 'format'])
   })
 
   it('rejects an unknown kind and an unknown format before running witr', async () => {
@@ -140,21 +182,21 @@ describe.skipIf(noShellStubs)('argument construction', () => {
   it('places -- before a process name so it stays positional', async () => {
     const tool = await mount({ binaryPath: stub('echo') })
 
-    expect(await run(tool, { target: 'node', kind: 'name' })).toBe('--no-color\n--\nnode\n')
+    expect((await run(tool, { target: 'node', kind: 'name' })).output).toBe('--no-color\n--\nnode\n')
   })
 
   it('keeps an option-shaped process name a name', async () => {
     const tool = await mount({ binaryPath: stub('echo') })
 
-    expect(await run(tool, { target: '--env', kind: 'name' })).toBe('--no-color\n--\n--env\n')
+    expect((await run(tool, { target: '--env', kind: 'name' })).output).toBe('--no-color\n--\n--env\n')
   })
 
   it('passes explicit kinds through their own flags', async () => {
     const tool = await mount({ binaryPath: stub('echo') })
 
-    expect(await run(tool, { target: '1234', kind: 'pid' })).toBe('--no-color\n--pid\n1234\n')
-    expect(await run(tool, { target: '3080', kind: 'port' })).toBe('--no-color\n--port\n3080\n')
-    expect(await run(tool, { target: '/var/lib/dpkg/lock', kind: 'file' })).toBe(
+    expect((await run(tool, { target: '1234', kind: 'pid' })).output).toBe('--no-color\n--pid\n1234\n')
+    expect((await run(tool, { target: '3080', kind: 'port' })).output).toBe('--no-color\n--port\n3080\n')
+    expect((await run(tool, { target: '/var/lib/dpkg/lock', kind: 'file' })).output).toBe(
       '--no-color\n--file\n/var/lib/dpkg/lock\n',
     )
   })
@@ -162,45 +204,69 @@ describe.skipIf(noShellStubs)('argument construction', () => {
   it('emits every flag before the -- terminator', async () => {
     const tool = await mount({ binaryPath: stub('echo') })
 
-    expect(await run(tool, { target: 'redis', exact: true, format: 'mermaid' })).toBe(
+    expect((await run(tool, { target: 'redis', exact: true, format: 'mermaid' })).output).toBe(
       '--exact\n--mermaid\n--no-color\n--\nredis\n',
     )
   })
 
-  it('treats a bare number as a PID first and falls back to a port', async () => {
-    const tool = await mount({ binaryPath: stub('pidMiss') })
+  it('reports the format it produced', async () => {
+    const tool = await mount({ binaryPath: stub('echo') })
 
-    expect(await run(tool, { target: '9999' })).toBe('PORT-RESULT\n')
-    expect(await run(tool, { target: '9999', kind: 'pid' })).not.toBe('PORT-RESULT\n')
+    expect((await run(tool, { target: 'node', format: 'tree' })).format).toBe('tree')
+    expect((await run(tool, { target: 'node' })).format).toBe('standard')
   })
 
   it('treats a slash-bearing target as a file', async () => {
     const tool = await mount({ binaryPath: stub('echo') })
 
-    expect(await run(tool, { target: './Cargo.lock' })).toBe('--no-color\n--file\n./Cargo.lock\n')
+    expect((await run(tool, { target: './Cargo.lock' })).output).toBe('--no-color\n--file\n./Cargo.lock\n')
   })
 })
 
-describe.skipIf(noShellStubs)('output handling', () => {
-  it('strips environment blocks from JSON output at every level', async () => {
-    const tool = await mount({ binaryPath: stub('json') })
+describe.skipIf(noShellStubs)('exit-code contract', () => {
+  it('falls back from a PID to a port using the not-found code, not the text', async () => {
+    const tool = await mount({ binaryPath: stub('pidMiss') })
 
-    const parsed = JSON.parse(await run(tool, { target: '42', kind: 'pid', format: 'json' }))
-    expect(parsed.Process.PID).toBe(42)
-    expect(parsed.Process.Env).toBeUndefined()
-    expect(parsed.Ancestry[0].Env).toBeUndefined()
+    const fellBack = await run(tool, { target: '9999' })
+    expect(fellBack.output).toBe('PORT-RESULT\n')
+    expect(fellBack.exitCode).toBe(0)
+
+    // An explicit kind is never second-guessed.
+    const explicit = await run(tool, { target: '9999', kind: 'pid' })
+    expect(explicit.output).toContain('No matching process or service found')
   })
 
-  it('surfaces a non-zero exit as a failure carrying the diagnostic', async () => {
-    const tool = await mount({ binaryPath: stub('fail') })
+  it('returns exit 1 as a successful answer carrying warnings', async () => {
+    const tool = await mount({ binaryPath: stub('warn') })
 
-    await expect(run(tool, { target: 'node' })).rejects.toThrow(/partial diagnostic/)
+    const value = await run(tool, { target: 'sleep', kind: 'pid' })
+    expect(value.exitCode).toBe(1)
+    expect(value.output).toContain('suspicious working directory')
   })
 
-  it('settles instead of throwing when the caller cancels', async () => {
-    const tool = await mount({ binaryPath: stub('slow') })
+  it('returns exit 6 (cause unknown) as a successful answer', async () => {
+    const tool = await mount({ binaryPath: stub('causeUnknown') })
 
-    expect(await runAbortable(tool, { target: 'node' }, 100)).toMatch(/aborted/i)
+    const value = await run(tool, { target: 'node' })
+    expect(value.exitCode).toBe(6)
+    expect(value.output).toContain('Cause unknown')
+  })
+
+  it('returns exit 2 (not found) and exit 3 (permission) as answers', async () => {
+    const notFound = await run(await mount({ binaryPath: stub('notFound') }), { target: 'node' })
+    expect(notFound.exitCode).toBe(2)
+
+    const denied = await run(await mount({ binaryPath: stub('denied') }), { target: 'node' })
+    expect(denied.exitCode).toBe(3)
+    expect(denied.output).toContain('owning process not detected')
+  })
+
+  it('fails only on exit 4 and exit 5', async () => {
+    const ambiguous = await mount({ binaryPath: stub('ambiguous') })
+    await expect(run(ambiguous, { target: 'node' })).rejects.toThrow(/exit 4[\s\S]*ambiguous match/)
+
+    const internal = await mount({ binaryPath: stub('internal') })
+    await expect(run(internal, { target: 'node' })).rejects.toThrow(/exit 5/)
   })
 
   it('reports a missing binary with an actionable message', async () => {
@@ -209,15 +275,33 @@ describe.skipIf(noShellStubs)('output handling', () => {
     await expect(run(tool, { target: 'node' })).rejects.toThrow(/binaryPath/)
   })
 
-  it('presents the completed trace as terminal output', async () => {
+  it('settles instead of throwing when the caller cancels', async () => {
+    const tool = await mount({ binaryPath: stub('slow') })
+
+    expect((await runAbortable(tool, { target: 'node' }, 100)).output).toMatch(/aborted/i)
+  })
+})
+
+describe.skipIf(noShellStubs)('output handling', () => {
+  it('strips environment blocks from JSON output and lifts its warnings', async () => {
+    const tool = await mount({ binaryPath: stub('json') })
+
+    const value = await run(tool, { target: '42', kind: 'pid', format: 'json' })
+    const parsed = JSON.parse(value.output)
+    expect(parsed.Process.PID).toBe(42)
+    expect(parsed.Process.Env).toBeUndefined()
+    expect(parsed.Ancestry[0].Env).toBeUndefined()
+    expect(value.warnings).toEqual(['Process is running from a suspicious working directory: /tmp'])
+  })
+
+  it('presents the completed trace as terminal output with the exit code', async () => {
     const tool = await mount({ binaryPath: stub('echo') })
 
-    const result = await run(tool, { target: 'node', kind: 'name' })
     const view = tool.presentResult?.(
       { target: 'node', kind: 'name' },
-      { content: [{ type: 'text', text: result }], isError: false },
-    )
-    expect(view).toMatchObject({ card: 'terminal', output: result })
+      { content: [{ type: 'text', text: 'trace body' }], isError: false, meta: { exitCode: 1, warningCount: 1 } },
+    ) as { card?: string; output?: string; exitCode?: number } | undefined
+    expect(view).toMatchObject({ card: 'terminal', output: 'trace body', exitCode: 1 })
   })
 })
 
@@ -225,25 +309,32 @@ describe.skipIf(!hasWitr)('witr integration', () => {
   it('returns standard process tracing for this process', async () => {
     const tool = await mount()
 
-    const result = await run(tool, { target: String(process.pid), kind: 'pid', format: 'standard' })
-    expect(typeof result).toBe('string')
-    expect(result).toContain('Process')
-    expect(result).toContain(String(process.pid))
+    const value = await run(tool, { target: String(process.pid), kind: 'pid', format: 'standard' })
+    expect(value.exitCode).toBeLessThan(2)
+    expect(value.output).toContain('Process')
+    expect(value.output).toContain(String(process.pid))
   })
 
   it('exports a mermaid diagram', async () => {
     const tool = await mount()
 
-    const result = await run(tool, { target: String(process.pid), kind: 'pid', format: 'mermaid' })
-    expect(result).toContain('mermaid')
-    expect(result).toContain('graph TD')
+    expect((await run(tool, { target: String(process.pid), kind: 'pid', format: 'mermaid' })).output).toContain('graph TD')
   })
 
   it('returns JSON without environment variables', async () => {
     const tool = await mount()
 
-    const parsed = JSON.parse(await run(tool, { target: String(process.pid), kind: 'pid', format: 'json' }))
+    const value = await run(tool, { target: String(process.pid), kind: 'pid', format: 'json' })
+    const parsed = JSON.parse(value.output)
     expect(parsed.Process.PID).toBe(process.pid)
     expect(parsed.Process.Env).toBeUndefined()
+  })
+
+  it('treats a missing process as an answer, not a failure', async () => {
+    const tool = await mount()
+
+    const value = await run(tool, { target: 'definitely-not-a-real-process-xyz', kind: 'name' })
+    expect(value.exitCode).toBe(2)
+    expect(value.output).toMatch(/no matching process/i)
   })
 })

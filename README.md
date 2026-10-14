@@ -51,6 +51,7 @@ graph TD
 - **File Lock Diagnostics:** Pinpoints which background process or daemon holds open a file descriptor.
 - **Multi-Format Projection:** Supports human-readable diagnostic text, compact hierarchical trees, JSON, and **Mermaid.js flowchart diagrams** for visual documentation. JSON output omits process environment variables, so tracing a process never copies its secrets into the model context.
 - **DeepSeek Plugin Manager UI:** Fully declared Cordis bundle with localized metadata, an icon, and configurable runtime parameters in the Web UI.
+- **Exit-Code Fidelity:** Classifies every trace from `witr`'s documented exit codes instead of scraping its output, so warnings, "not found", and "insufficient privileges" arrive as answers and only genuinely broken runs fail the call.
 - **Cancellation & Safety:** Strictly read-only; forwards `exec.signal` to the `witr` subprocess and reports a cancelled call as cancelled rather than as a failure.
 
 ---
@@ -111,6 +112,28 @@ directory rather than the directory the harness process was launched from.
 
 **Concurrency.** The tool is read-only, so it is marked concurrency-safe and several traces may share
 one tool batch.
+
+### Outcomes
+
+The plugin reads [`witr`'s exit codes](https://github.com/pranshuparmar/witr#72-exit-codes) rather
+than matching output text — witr documents the codes as the contract and the wording of its
+human-readable output as explicitly outside it. Only the outcomes that carry no answer fail the tool
+call:
+
+| `witr` exit | Meaning | Tool result |
+| :--- | :--- | :--- |
+| `0` | Found, clean | Answer |
+| `1` | Found, with warnings | **Answer** — warnings are the diagnostic payload |
+| `2` | Not found | Answer; also drives the PID → port fallback |
+| `3` | Insufficient privileges | Answer — witr's own output says how to escalate |
+| `4` | Invalid input, or an ambiguous name | Error; retry with `exact: true` or a fuller name |
+| `5` | Internal error | Error |
+| `6` | Found, but the cause can't be traced | **Answer** |
+| — | `witr` could not be started at all | Error naming `binaryPath` |
+
+The canonical result is structured — `{ output, format, exitCode, warnings? }` — with `output` as
+the model-facing projection. `warnings` is populated when `format: "json"` supplies witr's documented
+`Warnings` array, and the exit code and warning count travel to the UI as presentation metadata.
 
 ### Example Agent Interactions
 
