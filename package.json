@@ -24,6 +24,9 @@
       "patch": "cordis.patch.yml"
     }
   },
+  "scripts": {
+    "build": "tsc"
+  },
   "keywords": [
     "deepseek",
     "deepseek-harness",
@@ -35,18 +38,12 @@
   ],
   "author": "Martin M <martinm86867@gmail.com>",
   "license": "MIT",
-  "dependencies": {
-    "@deepseek-ai/schemastery": "workspace:~"
-  },
   "peerDependencies": {
-    "@deepseek-ai/cordis": "workspace:~",
-    "@deepseek-ai/dsh-tools": "workspace:*",
-    "@deepseek-ai/dsh-llm": "workspace:*"
+    "@deepseek-ai/cordis": "*",
+    "@deepseek-ai/dsh-tools": "*"
   },
   "devDependencies": {
-    "@deepseek-ai/cordis": "workspace:~",
-    "@deepseek-ai/dsh-tools": "workspace:*",
-    "@deepseek-ai/dsh-llm": "workspace:*",
-    "@deepseek-ai/dsh-system-prompt": "workspace:*"
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0"
   }
 }

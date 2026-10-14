@@ -17,13 +17,8 @@ jobs:
         with:
           node-version: 22
 
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          version: 10
-
-      - name: Install dependencies
-        run: pnpm install --no-frozen-lockfile
+      - name: Install TypeScript
+        run: npm install -g typescript
 
       - name: Typecheck
-        run: pnpm run build
+        run: tsc --project tsconfig.json
