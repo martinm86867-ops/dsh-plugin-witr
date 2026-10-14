@@ -1,0 +1,6 @@
+- insert:
+    - id: tool-witr
+      name: "dsh-plugin-witr"
+      config:
+        binaryPath: witr
+        timeoutMs: 10000

@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Witr Causal Tracer",
+    "description": "Explains why processes, network ports, or file locks exist by tracing their causal supervisors and containers."
+  }
+}

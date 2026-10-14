@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Witr 进程因果追踪器",
+    "description": "通过追溯父级 supervisor、容器和终端 shell，解释进程为何运行或端口/文件为何被占用。"
+  }
+}

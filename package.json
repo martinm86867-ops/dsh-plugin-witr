@@ -1,0 +1,51 @@
+{
+  "name": "dsh-plugin-witr",
+  "version": "1.0.0",
+  "description": "DeepSeek Harness plugin providing model-facing witr causal process, port, and lock tracing tools",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "cordis.patch.yml",
+    "locale"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "cordis.patch.yml"
+    }
+  },
+  "keywords": [
+    "deepseek",
+    "deepseek-harness",
+    "cordis",
+    "plugin",
+    "witr",
+    "process-tracing",
+    "port-tracing"
+  ],
+  "author": "Martin M <martinm86867@gmail.com>",
+  "license": "MIT",
+  "scripts": {
+    "build": "tsc"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": ">=3.0.0",
+    "@deepseek-ai/dsh-tools": ">=0.2.0"
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "^0.2.0"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "^3.18.0",
+    "@deepseek-ai/dsh-tools": "^0.2.1-alpha.2",
+    "typescript": "^5.7.0"
+  }
+}
